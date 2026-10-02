@@ -55,6 +55,24 @@ class TestRecordAuxiliaryUsage:
         assert r["input_tokens"] == 500
         assert r["output_tokens"] == 50
         assert r["api_call_count"] == 1
+        # Callers that do not have a classification keep the historical NULLs.
+        assert r["cost_status"] is None
+        assert r["cost_source"] is None
+
+    def test_records_explicit_cost_classification(self, db):
+        db.create_session("s1", source="cli")
+        db.record_auxiliary_usage(
+            "s1", "title_generation", model="deepseek-flash",
+            billing_provider="deepseek", input_tokens=1200, output_tokens=400,
+            estimated_cost_usd=0.0123, cost_status="estimated",
+            cost_source="official_docs_snapshot",
+        )
+        rows = _usage_rows(db, "s1")
+        assert len(rows) == 1
+        r = rows[0]
+        assert r["estimated_cost_usd"] == pytest.approx(0.0123)
+        assert r["cost_status"] == "estimated"
+        assert r["cost_source"] == "official_docs_snapshot"
 
     def test_accumulates_same_task_and_model(self, db):
         db.create_session("s1", source="cli")
@@ -188,6 +206,56 @@ class TestAmbientAccountingContext:
         assert rows[0]["model"] == "aux-m"
         assert rows[0]["input_tokens"] == 100
         assert rows[0]["output_tokens"] == 20
+
+    def test_record_aux_usage_preserves_priced_cost_classification(self, db):
+        from agent.aux_accounting import (
+            record_aux_usage,
+            reset_accounting_context,
+            set_accounting_context,
+        )
+
+        db.create_session("s1", source="cli")
+        token = set_accounting_context(db, "s1")
+        try:
+            record_aux_usage(
+                _mk_response(model="deepseek-flash", prompt=1200, completion=400),
+                "title_generation",
+                provider="deepseek",
+                base_url="https://api.deepseek.com/v1",
+            )
+        finally:
+            reset_accounting_context(token)
+        rows = _usage_rows(db, "s1")
+        assert len(rows) == 1
+        r = rows[0]
+        assert r["estimated_cost_usd"] > 0
+        assert r["cost_status"] == "estimated"
+        assert r["cost_source"] == "official_docs_snapshot"
+
+    def test_record_aux_usage_preserves_subscription_included_classification(self, db):
+        from agent.aux_accounting import (
+            record_aux_usage,
+            reset_accounting_context,
+            set_accounting_context,
+        )
+
+        db.create_session("s1", source="cli")
+        token = set_accounting_context(db, "s1")
+        try:
+            record_aux_usage(
+                _mk_response(model="gpt-5.4-mini", prompt=1000, completion=500),
+                "compression",
+                provider="openai-codex",
+                base_url="https://chatgpt.com/backend-api/codex",
+            )
+        finally:
+            reset_accounting_context(token)
+        rows = _usage_rows(db, "s1")
+        assert len(rows) == 1
+        r = rows[0]
+        assert r["estimated_cost_usd"] == pytest.approx(0.0)
+        assert r["cost_status"] == "included"
+        assert r["cost_source"] == "none"
 
 
     def test_moa_tasks_excluded(self, db):
