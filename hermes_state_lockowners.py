@@ -78,6 +78,61 @@ def parse_proc_locks(text: str, inodes: dict[tuple[int, int], str]) -> list[tupl
     return found
 
 
+
+def _translated_device_write_locks(
+    text: str, inodes: dict[tuple[int, int], str],
+) -> list[tuple[int, str, str]]:
+    """Attribute a /proc/locks writer despite mount-namespace device translation.
+
+    On some container/overlay mounts, stat(state.db-shm).st_dev differs from the
+    MAJ:MIN exported by /proc/locks even though st_ino agrees. An inode alone
+    is NOT sufficient evidence: other filesystems reuse inode numbers. Only
+    accept a candidate if the owning PID has an open descriptor whose *full*
+    (st_dev, st_ino) matches the target sidecar in our mount namespace.
+
+    Uninspectable PIDs and OFD locks are deliberately left unattributed.
+    """
+    by_inode: dict[int, list[tuple[int, str]]] = {}
+    for (dev, ino), sidecar in inodes.items():
+        by_inode.setdefault(ino, []).append((dev, sidecar))
+
+    found: list[tuple[int, str, str]] = []
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 8 or fields[1] == "->" or fields[3] != "WRITE":
+            continue
+        try:
+            major_s, minor_s, ino_s = fields[5].split(":")
+            dev = os.makedev(int(major_s, 16), int(minor_s, 16))
+            ino = int(ino_s)
+            pid = int(fields[4])
+            start = int(fields[6])
+            end = start if fields[7] == "EOF" else int(fields[7])
+        except ValueError:
+            continue
+        if pid <= 0 or (dev, ino) in inodes or ino not in by_inode:
+            continue
+
+        # Only scan a plausible holder's fds, never every PID in /proc.
+        try:
+            with os.scandir(f"/proc/{pid}/fd") as fds:
+                owner_files = set()
+                for fd in fds:
+                    try:
+                        st = fd.stat()
+                        if st.st_ino == ino:
+                            owner_files.add((st.st_dev, st.st_ino))
+                    except OSError:
+                        continue  # descriptor raced close or permissions forbid inspection
+        except OSError:
+            continue
+
+        for target_dev, sidecar in by_inode[ino]:
+            if (target_dev, ino) in owner_files:
+                found.append((pid, _describe_range(sidecar, start, end), sidecar))
+    return found
+
+
 def state_db_write_lock_holders(db_path) -> list[str]:
     """Operator-facing lines naming the processes that hold a write-class lock on ``db_path``.
 
@@ -102,7 +157,9 @@ def state_db_write_lock_holders(db_path) -> list[str]:
                 text = handle.read()
         except OSError:
             return []
-        held.extend(entry for entry in parse_proc_locks(text, inodes) if entry not in held)
+        entries = parse_proc_locks(text, inodes)
+        entries.extend(_translated_device_write_locks(text, inodes))
+        held.extend(entry for entry in entries if entry not in held)
     from hermes_state_holders import describe_holder_pid
 
     lines = []
@@ -118,7 +175,7 @@ def log_write_lock_holders(db_path, patience_s: float) -> None:
     if holders:
         detail = " | ".join(holders)
     else:
-        detail = "no write-class lock held at the deadline (the holder released just before it)"
+        detail = "no identifiable write-class lock at the deadline (holder may have released or be unobservable)"
     logger.warning(
         "state.db write lock unavailable for %.0fs (%s): %s", patience_s, Path(db_path).name, detail
     )
