@@ -82,15 +82,17 @@ def parse_proc_locks(text: str, inodes: dict[tuple[int, int], str]) -> list[tupl
 def _translated_device_write_locks(
     text: str, inodes: dict[tuple[int, int], str],
 ) -> list[tuple[int, str, str]]:
-    """Attribute a /proc/locks writer despite mount-namespace device translation.
+    """Attribute kernel write locks across container device-number translation.
 
-    On some container/overlay mounts, stat(state.db-shm).st_dev differs from the
-    MAJ:MIN exported by /proc/locks even though st_ino agrees. An inode alone
-    is NOT sufficient evidence: other filesystems reuse inode numbers. Only
-    accept a candidate if the owning PID has an open descriptor whose *full*
-    (st_dev, st_ino) matches the target sidecar in our mount namespace.
+    Linux can expose different MAJ:MIN values for the same mounted SQLite file
+    in stat() and /proc/locks. A shared inode number and an open target FD do
+    NOT prove the lock belongs to the target: two filesystems can reuse inodes,
+    and a process can have both files open.
 
-    Uninspectable PIDs and OFD locks are deliberately left unattributed.
+    Require both (a) the owning PID's FD resolves to the target's exact
+    (st_dev, st_ino) and (b) that *same FD's* /proc/PID/fdinfo lists the exact
+    kernel lock (owner, device, inode, byte range). If /proc is inaccessible,
+    remain inconclusive rather than guessing.
     """
     by_inode: dict[int, list[tuple[int, str]]] = {}
     for (dev, ino), sidecar in inodes.items():
@@ -113,23 +115,32 @@ def _translated_device_write_locks(
         if pid <= 0 or (dev, ino) in inodes or ino not in by_inode:
             continue
 
-        # Only scan a plausible holder's fds, never every PID in /proc.
         try:
             with os.scandir(f"/proc/{pid}/fd") as fds:
-                owner_files = set()
                 for fd in fds:
                     try:
                         st = fd.stat()
-                        if st.st_ino == ino:
-                            owner_files.add((st.st_dev, st.st_ino))
+                        if (st.st_dev, st.st_ino) not in inodes:
+                            continue
+                        if st.st_ino != ino:
+                            continue
+                        with open(f"/proc/{pid}/fdinfo/{fd.name}", encoding="ascii", errors="replace") as info:
+                            # The fdinfo prefix is "lock:", followed by the same
+                            # /proc/locks record. Ignore its per-snapshot sequence number.
+                            matching_lock = any(
+                                row.startswith("lock:") and row.split()[4:9] == fields[3:8]
+                                for row in info
+                            )
+                        if not matching_lock:
+                            continue
                     except OSError:
-                        continue  # descriptor raced close or permissions forbid inspection
+                        continue  # FD closed or proc access restricted during observation
+                    sidecar = inodes[(st.st_dev, st.st_ino)]
+                    entry = (pid, _describe_range(sidecar, start, end), sidecar)
+                    if entry not in found:
+                        found.append(entry)
         except OSError:
             continue
-
-        for target_dev, sidecar in by_inode[ino]:
-            if (target_dev, ino) in owner_files:
-                found.append((pid, _describe_range(sidecar, start, end), sidecar))
     return found
 
 
