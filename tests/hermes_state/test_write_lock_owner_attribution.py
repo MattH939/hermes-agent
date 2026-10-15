@@ -84,3 +84,45 @@ def test_live_writer_in_another_process_is_named_by_pid(tmp_path):
         holder.kill()
         holder.wait()
     assert state_db_write_lock_holders(db) == []
+
+
+@pytest.mark.platforms("linux")
+def test_translated_container_device_still_identifies_verified_wal_writer(tmp_path, monkeypatch):
+    """The MAJ:MIN in /proc/locks can differ from stat() inside an Incus container."""
+    import hermes_state_lockowners as lockowners
+
+    db = tmp_path / "state.db"
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE t(x)")
+        conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        shm_st = os.stat(str(db) + "-shm")
+        # Report a different kernel device but the *same* inode and holder PID.
+        other_minor = os.minor(shm_st.st_dev) + 1
+        fake_lock = (f"1: POSIX  ADVISORY  WRITE {os.getpid()} "
+                     f"{os.major(shm_st.st_dev):02x}:{other_minor:02x}:{shm_st.st_ino} 120 120\n")
+        monkeypatch.setattr(lockowners, "open", lambda *a, **k: io.StringIO(fake_lock), raising=False)
+
+        lines = state_db_write_lock_holders(db)
+        assert len(lines) == 1, lines
+        assert f"PID {os.getpid()} " in lines[0] and "WAL write" in lines[0], lines
+    finally:
+        conn.rollback()
+        conn.close()
+
+
+@pytest.mark.platforms("linux")
+def test_translated_device_inode_without_verified_owner_is_not_attributed(tmp_path, monkeypatch):
+    """A matching inode by itself is insufficient; the PID must hold the target fd."""
+    import hermes_state_lockowners as lockowners
+
+    db = tmp_path / "state.db"
+    db.write_bytes(b"")
+    st = os.stat(db)
+    other_minor = os.minor(st.st_dev) + 1
+    fake_lock = (f"1: POSIX  ADVISORY  WRITE {os.getpid()} "
+                 f"{os.major(st.st_dev):02x}:{other_minor:02x}:{st.st_ino} 1073741825 1073741825\n")
+    monkeypatch.setattr(lockowners, "open", lambda *a, **k: io.StringIO(fake_lock), raising=False)
+    assert state_db_write_lock_holders(db) == []
