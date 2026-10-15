@@ -110,7 +110,7 @@ def test_translated_container_device_still_identifies_verified_wal_writer(tmp_pa
             if path == "/proc/locks":
                 return io.StringIO(fake_lock)
             if path.startswith(f"/proc/{os.getpid()}/fdinfo/"):
-                return io.StringIO("lock:\\t" + fake_lock)
+                return io.StringIO("lock: " + fake_lock)
             return real_open(path, *args, **kwargs)
 
         monkeypatch.setattr(lockowners, "open", translated_open, raising=False)
